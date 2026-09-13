@@ -1,21 +1,52 @@
 name: app-build-action
-#推送Tag时触发
+
+# 触发方式：
+#   1. 推送 v* tag 时 → 自动构建 + 发 Release
+#   2. 推送到 master/dev 分支或提 PR → 仅构建（CI，不发 Release）
+#   3. 手动触发（workflow_dispatch）→ 可选是否发 Release、指定分支/版本
 on:
   push:
+    branches:
+      - master
+      - dev
     tags:
       - "v*"
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号，如 v1.11.1；留空则自动取 git describe"
+        required: false
+        default: ""
+      release:
+        description: "是否创建 GitHub Release（仅手动触发时生效）"
+        type: boolean
+        required: true
+        default: false
+      ref:
+        description: "构建的分支/ref（手动触发时可选）"
+        required: false
+        default: "master"
+
+# 全局权限（每个 job 也可单独设置）
+permissions:
+  contents: write
+
 jobs:
+  # ==================== 打包 Mac / iOS / Android ====================
   build-mac-ios-android:
     runs-on: macos-latest
     permissions:
       contents: write
     steps:
-      #签出代码
+      # 签出代码（不再写死 master，按触发事件自动选择分支/tag）
       - uses: actions/checkout@v4
         with:
-          ref: master
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ref || '' }}
 
-      #APK签名设置
+      # APK 签名设置
       - name: Download Android keystore
         id: android_keystore
         uses: timheuer/base64-to-file@v1.2
@@ -29,45 +60,45 @@ jobs:
           echo "keyPassword=${{ secrets.KEY_PASSWORD }}" >> simple_live_app/android/key.properties
           echo "keyAlias=${{ secrets.KEY_ALIAS }}" >> simple_live_app/android/key.properties
 
-      #设置JAVA环境
+      # 设置 JAVA 环境
       - uses: actions/setup-java@v4
         with:
           distribution: "zulu"
           java-version: "17"
           cache: "gradle"
 
-      #设置Flutter
+      # 设置 Flutter
       - name: Flutter action
         uses: subosito/flutter-action@v2
         with:
           flutter-version: "3.38.x"
           cache: true
 
-      # 打开MAC Desktop支持
+      # 打开 MAC Desktop 支持
       - name: Enable Flutter Desktop
         run: flutter config --enable-macos-desktop
 
-      #更新Flutter的packages
+      # 更新 Flutter 的 packages
       - name: Restore packages
         run: |
           cd simple_live_app
           flutter pub get
 
-      # 安装appdmg npm install -g appdmg
+      # 安装 appdmg
       - name: Install appdmg
         run: npm install -g appdmg
 
-      # 设置flutter_distributor环境
+      # 设置 flutter_distributor 环境
       - name: Install flutter_distributor
         run: dart pub global activate flutter_distributor
 
-      #打包APK
+      # 打包 APK
       - name: Build APK
         run: |
           cd simple_live_app
           flutter build apk --release --split-per-abi
 
-      #上传APK至Artifacts
+      # 上传 APK 至 Artifacts
       - name: Upload APK to Artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -77,13 +108,13 @@ jobs:
             simple_live_app/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
             simple_live_app/build/app/outputs/flutter-apk/app-x86_64-release.apk
 
-      #打包iOS
+      # 打包 iOS
       - name: Build IPA
         run: |
           cd simple_live_app
           flutter build ios --release --no-codesign
 
-      #创建未签名ipa
+      # 创建未签名 ipa
       - name: Create IPA
         run: |
           cd simple_live_app
@@ -93,7 +124,7 @@ jobs:
           zip -q -r ios_no_sign.ipa Payload
           cd ../../..
 
-      #上传IPA至Artifacts
+      # 上传 IPA 至 Artifacts
       - name: Upload IPA to Artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -101,13 +132,13 @@ jobs:
           path: |
             simple_live_app/build/ios/iphoneos/ios_no_sign.ipa
 
-      # 打包MAC
+      # 打包 MAC
       - name: Build MacOS
         run: |
           cd simple_live_app
           flutter_distributor package --platform macos --targets dmg,zip --skip-clean
 
-      # 上传MAC至Artifacts
+      # 上传 MAC 至 Artifacts
       - name: Upload MacOS to Artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -116,20 +147,33 @@ jobs:
             simple_live_app/build/dist/*/*.dmg
             simple_live_app/build/dist/*/*.zip
 
-      #获取版本信息（自动从 Git Tag 提取）
-      - name: Get version from tag
+      # ===== 获取版本信息（自动从 Git Tag / 手动输入 / git describe 提取）=====
+      - name: Get version
         id: version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.version }}" ]; then
+            raw="${{ github.event.inputs.version }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            raw="${GITHUB_REF#refs/tags/}"
+          else
+            raw=$(git describe --tags --always 2>/dev/null || echo "dev")
+          fi
+          echo "RAW=${raw}" >> "$GITHUB_OUTPUT"
+          echo "VERSION=${raw#v}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Version = ${raw}, Clean = ${raw#v}"
       - name: Echo version
         run: echo "${{ steps.version.outputs.VERSION }}"
 
-      #上传至Release
+      # 上传至 Release（仅在推 tag 或手动勾选 release 时执行）
       - name: Upload Release
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true')
         uses: softprops/action-gh-release@v1
         with:
-          name: "${{ steps.version.outputs.VERSION }}"
+          name: "${{ steps.version.outputs.RAW }}"
+          tag_name: "${{ steps.version.outputs.RAW }}"
           generate_release_notes: true
-          prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
+          prerelease: ${{ contains(steps.version.outputs.RAW, 'alpha') || contains(steps.version.outputs.RAW, 'beta') || contains(steps.version.outputs.RAW, 'rc') }}
           token: ${{ secrets.TOKEN }}
           files: |
             simple_live_app/build/app/outputs/flutter-apk/app-x86_64-release.apk
@@ -138,47 +182,46 @@ jobs:
             simple_live_app/build/ios/iphoneos/ios_no_sign.ipa
             simple_live_app/build/dist/*/*.dmg
             simple_live_app/build/dist/*/*.zip
-      #完成
+      # 完成
       - run: echo "🍏 This job's status is ${{ job.status }}."
 
-  # 打包Linux
+  # ==================== 打包 Linux ====================
   build-linux:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
-      # 签出代码
       - uses: actions/checkout@v4
         with:
-          ref: master
-      # 设置Flutter环境
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ref || '' }}
+
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           flutter-version: "3.38.x"
           cache: true
-      # 安装依赖
+
       - name: Update apt-get
         run: sudo apt-get update
       - name: Install Dependencies
         run: sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libasound2-dev libmpv-dev mpv
-      # 打开Linux Desktop支持
+
       - name: Enable Flutter Desktop
         run: flutter config --enable-linux-desktop
-      # 更新Flutter的packages
+
       - name: Restore Packages
         run: |
           cd simple_live_app
           flutter pub get
-      # 设置flutter_distributor环境
+
       - name: Install flutter_distributor
         run: dart pub global activate flutter_distributor
-      # build Linux ZIP\DMG
+
       - name: Build Linux
         run: |
           cd simple_live_app
           flutter_distributor package --platform linux --targets deb,zip --skip-clean
-      # 上传Linux包至Artifacts
+
       - name: Upload Linux APP to Artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -187,59 +230,71 @@ jobs:
             simple_live_app/build/dist/*/*.deb
             simple_live_app/build/dist/*/*.zip
 
-      #获取版本信息（自动从 Git Tag 提取）
-      - name: Get version from tag
+      # ===== 获取版本信息 =====
+      - name: Get version
         id: version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.version }}" ]; then
+            raw="${{ github.event.inputs.version }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            raw="${GITHUB_REF#refs/tags/}"
+          else
+            raw=$(git describe --tags --always 2>/dev/null || echo "dev")
+          fi
+          echo "RAW=${raw}" >> "$GITHUB_OUTPUT"
+          echo "VERSION=${raw#v}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Version = ${raw}, Clean = ${raw#v}"
       - name: Echo version
         run: echo "${{ steps.version.outputs.VERSION }}"
 
-      #上传至Release
+      # 上传至 Release
       - name: Upload Release
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true')
         uses: softprops/action-gh-release@v1
         with:
-          name: "${{ steps.version.outputs.VERSION }}"
+          name: "${{ steps.version.outputs.RAW }}"
+          tag_name: "${{ steps.version.outputs.RAW }}"
           generate_release_notes: true
-          prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
+          prerelease: ${{ contains(steps.version.outputs.RAW, 'alpha') || contains(steps.version.outputs.RAW, 'beta') || contains(steps.version.outputs.RAW, 'rc') }}
           token: ${{ secrets.TOKEN }}
           files: |
             simple_live_app/build/dist/*/*.deb
             simple_live_app/build/dist/*/*.zip
-        #完成
       - run: echo "🍏 Linux job's status is ${{ job.status }}."
 
-  # 打包Windows
+  # ==================== 打包 Windows ====================
   build-windows:
     runs-on: windows-latest
     permissions:
       contents: write
     steps:
-      # 签出代码
       - uses: actions/checkout@v4
         with:
-          ref: master
-      # 设置Flutter环境
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ref || '' }}
+
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           flutter-version: "3.38.x"
           cache: true
+
       - name: Enable Flutter Desktop
         run: flutter config --enable-windows-desktop
+
       - name: Restore Packages
         run: |
           cd simple_live_app
           flutter pub get
-      # 设置flutter_distributor环境
+
       - name: Install flutter_distributor
         run: dart pub global activate flutter_distributor
-      # build Windows ZIP\MSIX
+
       - name: Build Windows
         run: |
           cd simple_live_app
           flutter_distributor package --platform windows --targets msix,zip --skip-clean
 
-      # 上传Windows至Artifacts
       - name: Upload Windows APP to Artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -248,25 +303,35 @@ jobs:
             simple_live_app/build/dist/*/*.msix
             simple_live_app/build/dist/*/*.zip
 
-      #获取版本信息（自动从 Git Tag 提取）
-      - name: Get version from tag
+      # ===== 获取版本信息（Windows 显式 bash，避免 pwsh 语法差异）=====
+      - name: Get version
         id: version
         shell: bash
-        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.version }}" ]; then
+            raw="${{ github.event.inputs.version }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            raw="${GITHUB_REF#refs/tags/}"
+          else
+            raw=$(git describe --tags --always 2>/dev/null || echo "dev")
+          fi
+          echo "RAW=${raw}" >> "$GITHUB_OUTPUT"
+          echo "VERSION=${raw#v}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Version = ${raw}, Clean = ${raw#v}"
       - name: Echo version
         run: echo "${{ steps.version.outputs.VERSION }}"
 
-      #上传至Release
+      # 上传至 Release
       - name: Upload Release
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true')
         uses: softprops/action-gh-release@v1
         with:
-          name: "${{ steps.version.outputs.VERSION }}"
+          name: "${{ steps.version.outputs.RAW }}"
+          tag_name: "${{ steps.version.outputs.RAW }}"
           generate_release_notes: true
-          prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
+          prerelease: ${{ contains(steps.version.outputs.RAW, 'alpha') || contains(steps.version.outputs.RAW, 'beta') || contains(steps.version.outputs.RAW, 'rc') }}
           token: ${{ secrets.TOKEN }}
           files: |
             simple_live_app/build/dist/*/*.msix
             simple_live_app/build/dist/*/*.zip
-
-      #完成
       - run: echo "🍏 Windows job's status is ${{ job.status }}."
